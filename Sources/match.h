@@ -17,6 +17,12 @@
 
 #endif /* PARANOID_CHECK */
 
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    #define get_matched_bits __builtin_ctzl
+#else
+    #define get_matched_bits __builtin_clzl
+#endif
+
 /* Please retain this line */
 const char fast_lm_copyright[] = " Fast match finder for zlib, http://www.gildor.org/en/projects/zlib ";
 
@@ -120,34 +126,54 @@ local uInt longest_match(s, cur_match)
     Assert(cur_match - offset < s->strstart, "no future");
 
     do {
-        /* Find a candidate for matching using hash table. Jump over hash
-         * table chain until we'll have a partial march. Doing "break" when
-         * matched, and NEXT_CHAIN to try different place.
+        int cont = 1;
+
+        /* following code is based on Cloudflare's improvements.
+         * https://github.com/cloudflare/zlib/blob/gcc.amd64/deflate.c
+         * The improvements do:
+         *  1. ease the compiler to yield good code layout
+         *     to improving instruction-fetching efficiency
+         *  2. ease the compiler to promote "s->window" into register.
+         *  3. examines sizeof(long)-byte-match at a time
+         *     long is 4 bytes on 32bits platform, 8 bytes
+         *     on 64bits platform
+         *  4. use clz/ctz instructions on modern processors
+         * While new change here is to compare based on different best_len
+         * so registers width are fully used and get higher prossiblity to
+         * find longer match for later get_match_len
          */
-        if (best_len < MIN_MATCH) {
-            /* Here we have best_len < MIN_MATCH, and this means, that
-             * offset == 0. So, we need to check only first 2 bytes of
-             * match (remaining 1 byte will be the same, because of nature of
-             * hash function)
-             */
-            for (;;) {
-                if (*(ushf*)(match_base + cur_match) == scan_start) break;
-                NEXT_CHAIN;
-            }
-        } else if (best_len > MIN_MATCH) {
-            /* current len > MIN_MATCH (>= 4 bytes); compare 1st 4 bytes and last 2 bytes */
-            for (;;) {
-                if (*(ushf*)(match_base2 + cur_match) == scan_end &&
-                    *(uIntf*)(match_base + cur_match) == scan_start32) break;
-                NEXT_CHAIN;
-            }
+        if (best_len < sizeof(unsigned long)) {
+            /* just load one chunk into register */
+            unsigned long scan_chunk = *(unsigned long *)scan;
+            unsigned long read_chunk;
+            short len = 0;
+            do {
+                match = match_base + cur_match;
+                read_chunk = *(unsigned long *)match;
+                len = get_matched_bits(read_chunk ^ scan_chunk)>>3;
+                if (len <= best_len) {
+                    /* move to next elem on current chain */
+                    NEXT_CHAIN
+                } else break;
+            } while(1);
         } else {
-            /* current len is exactly MIN_MATCH (3 bytes); compare 4 bytes */
-            for (;;) {
-                if (*(uIntf*)(match_base + cur_match) == scan_start32) break;
-                NEXT_CHAIN;
-            }
+            /* more than register width, load HEAD and END */
+            unsigned long scan_head = *(unsigned long *)scan;
+            unsigned long scan_end = *(unsigned long *)(scan+best_len-sizeof(unsigned long)+1);
+            unsigned long read_head, read_end;
+            do {
+                match = match_base + cur_match;
+                read_head = *(unsigned long *)match;
+                read_end = *(unsigned long *)(match+best_len-sizeof(unsigned long)+1);
+                if ((read_head^scan_head) ^ (read_end ^ scan_end)) {
+                    /* move to next elem on current chain */
+                    NEXT_CHAIN
+                } else break;
+            } while(1);
         }
+
+        if (!cont)
+            break;
 
         /* Skip 1 byte */
         match = match_base + cur_match + 1;
